@@ -72,9 +72,20 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - uses: golangci/golangci-lint-action@v6
+      # Pin BOTH the action major and the golangci-lint version.
+      #
+      # `version: latest` is a trap here: the released binary is built with
+      # whatever Go the golangci-lint maintainers used, and golangci-lint
+      # refuses to run when that is OLDER than the `go` directive in go.mod:
+      #
+      #   can't load config: the Go language version (go1.24) used to build
+      #   golangci-lint is lower than the targeted Go version (1.25.0)
+      #
+      # So a repo can be lint-clean locally and red in CI purely because of
+      # who built the binary. Pinning makes the pairing explicit and reviewable.
+      - uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.12.2
 
   integration:
     name: Integration tier
