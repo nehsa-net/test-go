@@ -1,0 +1,16 @@
+# Build output
+/weatherd
+/bin/
+
+# Coverage
+coverage.out
+coverage.html
+
+# Fuzzing corpus found by the fuzzer (crashers ARE committed; the cache is not)
+testdata/fuzz/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store

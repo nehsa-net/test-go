@@ -1,0 +1,9 @@
+{
+  "name": "Cape Canaveral",
+  "weather": [
+    { "main": "Clouds", "description": "broken clouds" }
+  ],
+  "main": { "temp": 27.5, "humidity": 74 },
+  "dt": 1723400000,
+  "cod": 200
+}

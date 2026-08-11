@@ -1,0 +1,9 @@
+{
+  "name": "Orlando",
+  "weather": [
+    { "main": "Rain", "description": "light rain" }
+  ],
+  "main": { "temp": 24.0, "humidity": 88 },
+  "dt": 1723400500,
+  "cod": 200
+}
