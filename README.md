@@ -77,6 +77,31 @@ every linter silently skips two thirds of the suite and still reports success.
 
 ---
 
+## Running the tests without CI
+
+**GitHub Actions is disabled on this repository.** Nothing runs automatically on
+push, so the gate is whatever you run by hand.
+
+The workflow in `.github/workflows/test.yml` is kept deliberately: it is
+reference material, and it has been verified end to end by executing it in a
+real runner container with [`act`](https://github.com/nektos/act). It is
+accurate; it is simply not switched on.
+
+| Command | What it covers |
+|---|---|
+| `make test` | Unit tier with `-race`. The one to run on every change |
+| `make test-integration` | Integration tier — needs Docker running |
+| `make test-e2e` | E2E tier — builds the binary and drives it |
+| `make test-all` | All three, fastest failure first |
+| `make ci` | Everything the workflow would run: fmt-check, lint, all tiers |
+| `make help` | Every target |
+
+**`make ci` is the gate.** With Actions off it is the only thing between a
+mistake and `main`, so run it before every commit — not just before the ones
+that feel risky.
+
+---
+
 ## How it works
 
 ### Layout
@@ -692,6 +717,11 @@ go mod tidy
 5. **E2E tests** for the binary: config validation, startup, shutdown, health.
 
 ### Step 6 — Wire the gate
+
+> **Note:** Actions is switched off on *this* repository (see "Running the tests
+> without CI"), so the gate here is `make ci`, run by hand. The advice in this
+> section is for the repo you are setting up, where you should wire it properly.
+
 
 Copy `.github/workflows/test.yml`, then in GitHub set branch protection on
 `main` to require the **All tiers green** check. A tier that runs only on

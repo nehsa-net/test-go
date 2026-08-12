@@ -17,6 +17,21 @@ thing the repo is for — writing an example down while it is fresh.
 
 That exemption is **not inherited**. It covers this repo only, at this root.
 
+## GitHub Actions is disabled here
+
+Actions is switched off at the repository level, so **nothing runs on push**.
+`make ci` is the only gate, and it runs on your machine or not at all.
+
+The workflow in `.github/workflows/test.yml` is kept on purpose: it is part of
+what this repo teaches, and it has been verified by executing it in a real
+runner container with `act`. Do not delete it, and do not assume it ran.
+
+Re-enable with:
+
+```bash
+gh api -X PUT repos/nehsa-net/<repo>/actions/permissions -F enabled=true
+```
+
 ## What must stay true
 
 - **The suite is green, on every tier, at every commit.** A reference framework
