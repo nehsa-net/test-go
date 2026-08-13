@@ -365,11 +365,218 @@ Two caveats worth knowing:
 
 ---
 
-## Patterns worth copying
+## Dependency injection
 
-### Table-driven tests
+Go has no DI framework here and needs none. **Injection in Go is a struct field
+or a function parameter** — and the language's interface rules make it cheaper
+than in most languages, because the implementation never has to declare that it
+satisfies anything.
 
-The Go idiom. One row per case, each named, so a failure names the case.
+[The seams](#why-the-tiers-can-exist-at-all-the-seams) shows the three that carry
+this repo. This section is the general form.
+
+### The rule
+
+> A package that reaches out — network, clock, filesystem, database,
+> environment, randomness — takes that capability as a parameter.
+
+The payoff is concrete: **there is no mocking framework in this repo, no
+generated mocks, and no `init()` doing setup.** A fake is a struct with the
+methods the consumer needs, and it lives in the test file that uses it.
+
+### Accept interfaces, return structs
+
+```go
+// service.go — declared next to the CONSUMER, not next to Client.
+type Provider interface {
+    Fetch(ctx context.Context, city string) (Conditions, error)
+}
+
+func NewService(p Provider, opts ...Option) *Service { … }   // takes an interface, returns a struct
+```
+
+This is the single most important convention, and the reason is Go-specific:
+**interfaces are satisfied implicitly.** `Client` never mentions `Provider`, so
+the consumer is free to declare the narrowest interface it actually needs
+without touching the implementation or creating an import cycle.
+
+A one-method interface is a twelve-line fake:
+
+```go
+type fakeProvider struct {
+    conditions weather.Conditions
+    err        error
+
+    calls    int
+    lastCity string
+}
+
+func (f *fakeProvider) Fetch(_ context.Context, city string) (weather.Conditions, error) {
+    f.calls++
+    f.lastCity = city
+    return f.conditions, f.err
+}
+```
+
+**A wide interface is a design smell before it is a testing problem.** If faking
+it is painful, split it at the consumers.
+
+### Four shapes, in order of preference
+
+**1. A struct field.** The cheapest seam that exists.
+
+```go
+type Client struct {
+    BaseURL string   // a field, not a constant — so a test can point it at httptest.Server
+    APIKey  string
+    HTTP    Doer     // an interface, not *http.Client — so a test can inject a stub
+}
+```
+
+`BaseURL` being a field rather than a `const` is the one change that makes the
+whole integration tier possible. A package-level `const apiURL = "https://…"` is
+untestable at any price short of a network.
+
+**2. A constructor with a sensible default.**
+
+```go
+func NewClient(baseURL, apiKey string, doer Doer) *Client {
+    if doer == nil {
+        doer = &http.Client{Timeout: 10 * time.Second}   // production stays terse
+    }
+    …
+}
+```
+
+Nil meaning "give me the real one" keeps the seam free at the call site in
+`main`, which is what stops people arguing that seams clutter production code.
+
+**3. Functional options**, once there are more than two optional dependencies.
+
+```go
+type Option func(*Service)
+
+func WithRecorder(r Recorder) Option    { return func(s *Service) { s.recorder = r } }
+func WithClock(now func() time.Time) Option { return func(s *Service) { s.now = now } }
+
+svc := weather.NewService(provider)                                  // production
+svc := weather.NewService(provider, weather.WithClock(frozenClock))  // test
+```
+
+Options keep the common construction to one argument while leaving every
+dependency swappable. The alternative — a config struct with eight fields, six
+of them usually zero — reads worse at every call site.
+
+**4. A function parameter**, when the dependency is a single capability.
+
+```go
+func Load(lookup func(string) (string, bool)) (Config, error) { … }
+
+cfg, err := config.Load(func(k string) (string, bool) { return envMap[k], true })
+```
+
+`Load` taking a lookup function rather than calling `os.Getenv` is what lets the
+config tests run in parallel. `t.Setenv` **panics** in a test that calls
+`t.Parallel()`, because the process environment is shared — so a package that
+reads the environment directly forces its entire test file to run serially.
+
+### Inject the ambient dependencies too
+
+```go
+// Time
+func WithClock(now func() time.Time) Option
+svc := weather.NewService(p, weather.WithClock(func() time.Time { return frozen }))
+```
+
+Any assertion about elapsed time that calls `time.Now()` is a race against the
+wall clock: it passes locally and fails in CI at 23:59:59, or on the day the
+clocks change.
+
+**For concurrency and timeouts, Go 1.25 offers a better answer than a clock
+seam** — `testing/synctest` runs a goroutine bubble against a fake clock:
+
+```go
+func TestRetryBackoff(t *testing.T) {
+    synctest.Test(t, func(t *testing.T) {
+        start := time.Now()
+        done := make(chan struct{})
+        go func() { time.Sleep(2 * time.Hour); close(done) }()
+        <-done
+
+        if elapsed := time.Since(start); elapsed != 2*time.Hour {
+            t.Fatalf("elapsed = %v, want 2h", elapsed)
+        }
+    })
+}
+```
+
+That test is instant and exact. Inside the bubble, time advances only when every
+goroutine is blocked, so `time.Sleep` costs nothing and there is no polling
+interval to tune. Use it for retry backoff, timeouts and context deadlines; keep
+the injected clock for plain "how old is this value" arithmetic.
+
+### `context.Context` is a dependency, and it goes first
+
+```go
+func (s *Service) Describe(ctx context.Context, city string, units Units) (Report, error)
+```
+
+Always the first parameter, never stored in a struct. In tests, `t.Context()`
+(Go 1.24+) is cancelled automatically when the test finishes, so a hung request
+cannot outlive the test that started it:
+
+```go
+ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+defer cancel()
+```
+
+### The composition root
+
+`main()` reads config, wires dependencies, and serves — nothing else:
+
+```go
+func run(logger *slog.Logger) error {
+    cfg, err := config.Load(os.LookupEnv)          // the ONE os.LookupEnv in the program
+    …
+    httpClient := &http.Client{Timeout: time.Duration(cfg.RequestTimeout) * time.Second}
+    client := weather.NewClient(cfg.UpstreamURL, cfg.APIKey, httpClient)
+    svc := weather.NewService(client, opts...)
+    …
+}
+```
+
+Two details worth copying. **`run` returns an error instead of calling
+`os.Exit`**, so it stays callable from a test. And **`main` is three lines**,
+because `func main()` is the one function no test can invoke — everything you
+put there is code the suite can never reach.
+
+### Prove the wiring at compile time
+
+```go
+var _ weather.Recorder = (*store.Store)(nil)
+```
+
+One line, no runtime cost, and a signature drift becomes a build failure instead
+of a nil interface at 3am. Put one of these next to every implementation that
+exists to satisfy somebody else's interface.
+
+### Anti-patterns
+
+| Instead of | Do | Because |
+|---|---|---|
+| `const apiURL = "https://…"` | A `BaseURL` field | A constant cannot be pointed at `httptest.Server` |
+| `http.DefaultClient` | An injected `Doer` | The default client has no timeout and is shared process-wide |
+| `os.Getenv` deep in a package | `Load(lookup)` at the root | Env reads force the whole test file to run serially |
+| `time.Now()` in the code under test | An injected clock, or `synctest` | Otherwise the assertion races the wall clock |
+| A package-level `var db *sql.DB` | A `Store` struct holding it | Package state is shared by every test in the package |
+| `init()` doing setup | Explicit construction | `init` runs before the test can configure anything |
+| An interface with twelve methods | Several one-method interfaces at the consumers | Wide interfaces are what make `mockgen` feel necessary |
+
+---
+
+## Parameterization
+
+### Table-driven tests — the Go idiom
 
 ```go
 func TestParseUnits(t *testing.T) {
@@ -403,8 +610,185 @@ func TestParseUnits(t *testing.T) {
 }
 ```
 
-Adding a case is one line. Compare that to the copy-paste alternative, where
-adding a case means duplicating a function and editing two values in it.
+Adding a case is one line. Four details make the difference between this and a
+table that wastes everyone's time:
+
+- **`name` is a field, and `t.Run` uses it.** Without a subtest, a failure says
+  `TestParseUnits` and you count rows to find out which one.
+- **The zero value is a real case.** `wantErr` unset means "expect no error", so
+  the happy rows stay short. Design the struct so the common case is the zero
+  value.
+- **`t.Parallel()` twice** — once for the parent, once inside each subtest.
+- **Since Go 1.22 `tc := tc` is unnecessary.** The loop variable is per
+  iteration now. Delete it when you see it; do not copy it into new code.
+
+### Subtest names become part of the test's address
+
+```bash
+go test -run 'TestParseUnits/kelvin_is_rejected' ./internal/weather/
+```
+
+**Go rewrites spaces to underscores** in subtest names, so the name you write in
+the table is not quite the name you type on the command line. Two consequences:
+
+- Keep names short and shell-safe. A name with a slash creates an accidental
+  extra level of nesting.
+- Duplicate names are silently disambiguated with `#01`, which makes `-run`
+  ambiguous. Names must be unique within the table.
+
+### Map-based tables: randomised order, on purpose
+
+```go
+tests := map[string]struct {
+    input string
+    want  weather.Units
+}{
+    "empty defaults to imperial": {input: "", want: weather.Fahrenheit},
+    "mixed case is accepted":     {input: "MeTrIc", want: weather.Celsius},
+}
+
+for name, tc := range tests {
+    t.Run(name, func(t *testing.T) { … })
+}
+```
+
+Go randomises map iteration, so this form **runs the cases in a different order
+every time** — which surfaces a case that only passes because another ran first.
+The cost is that failure output arrives in a different order each run, and it
+cannot express an intentionally ordered sequence. Use the slice form by default
+and the map form when you suspect cross-case coupling.
+
+### One table, several implementations
+
+The highest-value form: prove two implementations are interchangeable by running
+one suite against both.
+
+```go
+func testRecorder(t *testing.T, newRecorder func(t *testing.T) weather.Recorder) {
+    t.Helper()
+
+    t.Run("records an observation", func(t *testing.T) {
+        rec := newRecorder(t)
+        if err := rec.Record(t.Context(), sample); err != nil {
+            t.Fatalf("Record() = %v, want nil", err)
+        }
+    })
+
+    t.Run("rejects a duplicate", func(t *testing.T) { … })
+}
+```
+
+```go
+// unit tier
+func TestFakeRecorder(t *testing.T) { testRecorder(t, newFakeRecorder) }
+
+// integration tier, behind //go:build integration
+func TestStoreRecorder(t *testing.T) { testRecorder(t, newPostgresRecorder) }
+```
+
+This is what stops the in-memory fake drifting from the real store. **A fake
+nobody tests is a fake that will eventually make the unit tier pass while
+production is broken.**
+
+Only genuinely shared behaviour belongs in the shared suite. `NUMERIC(5,2)`
+coming back as a string, and `UNIQUE (city, observed_at)` firing, are Postgres
+facts — they belong in the integration test, not in a contract the fake is
+expected to satisfy.
+
+### Helpers take `testing.TB`, not `*testing.T`
+
+```go
+func FreePort(tb testing.TB) int {
+    tb.Helper()
+    …
+}
+```
+
+`testing.TB` is satisfied by `*testing.T`, `*testing.B` and `*testing.F`, so one
+helper serves tests, benchmarks and fuzz targets. Naming the parameter `tb`
+rather than `t` is the convention that signals it.
+
+`tb.Helper()` is not optional: without it every failure reports the line inside
+the helper, and you have to read the stack to find which test actually broke.
+
+### Sub-benchmarks parameterize the same way
+
+```go
+func BenchmarkRender(b *testing.B) {
+    for _, size := range []int{1, 10, 100} {
+        b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+            for b.Loop() {            // Go 1.24+; replaces for i := 0; i < b.N; i++
+                render(size)
+            }
+        })
+    }
+}
+```
+
+`b.Run` names appear in `benchstat` output, so `size=1` and `size=100` become
+comparable rows rather than two unrelated numbers.
+
+### Generative parameterization: fuzzing
+
+```go
+func FuzzNormaliseCity(f *testing.F) {
+    for _, seed := range []string{"", " ", "Orlando", "日本 東京"} {
+        f.Add(seed)                          // the seed corpus IS a table
+    }
+    f.Fuzz(func(t *testing.T, input string) {
+        got, err := weather.NormaliseCity(input)
+        if err == nil && got == "" {
+            t.Error("success result must not be empty")
+        }
+    })
+}
+```
+
+A table states cases you thought of; a fuzz target states a **property** that
+must hold for cases you did not. Assert properties ("never panics", "never
+returns empty on success", "round-trips"), never specific outputs — a fuzz
+target asserting an exact value is a table test with extra steps.
+
+Seeds run as ordinary tests in a normal `go test`, so a fuzz target is never
+dead weight. A crash is written to `testdata/fuzz/`; commit it, and it becomes a
+permanent regression case.
+
+### Build tags parameterize the tier
+
+```go
+//go:build integration
+```
+
+`go test ./...` compiles and runs only the unit tier; everything else is opt-in
+via `-tags`. This is the coarsest axis and the most valuable one, because it is
+what keeps the default command fast enough that people actually run it.
+
+The trap: **a file whose build tag excludes it is not compiled**, so it can rot
+without failing anything. `make ci` runs every tier for exactly that reason, and
+`golangci-lint` here is configured to see the tagged files too.
+
+### When not to parameterize
+
+- **When the rows assert different things.** A body full of
+  `if tc.wantErr != nil` branches is three tests wearing a trenchcoat.
+- **When there are two cases.** Two named functions read better than a two-row
+  table plus a loop.
+- **When the table restates the implementation.** A table of conversions checked
+  by re-doing the conversion tests the table.
+- **When a row needs a comment to explain why it exists.** That is a test with a
+  name, not a row.
+
+---
+
+## Patterns worth copying
+
+### Table-driven tests
+
+The Go idiom. One row per case, each named, so a failure names the case, and
+adding a case is one line rather than a duplicated function. See
+[Parameterization](#parameterization) for the full form, map-based tables,
+running one table against several implementations, and the `-run` addressing
+that subtest names give you.
 
 ### `t.Fatalf` vs `t.Errorf`
 
@@ -618,6 +1002,69 @@ The rule that matters in testify: `require` stops, `assert` continues. Using
 
 And in both styles: **never compare floats with `==`.** Use `math.Abs(got-want) <
 1e-9` or `assert.InDelta`.
+
+---
+
+## Best practices
+
+The short list. Everything here is expanded somewhere above; this is the version
+to read before a review.
+
+### Shape the code so it can be tested
+
+- **Accept interfaces, return structs**, and declare the interface at the
+  consumer. Implicit satisfaction means the narrow interface costs the
+  implementation nothing.
+- **A field, not a constant.** `BaseURL string` is the difference between a
+  package the integration tier can drive and one it cannot.
+- **No package-level mutable state, and no `init()` doing setup.** Both are
+  shared by every test in the package, and `init` runs before a test can
+  configure anything.
+- **`main()` does three things**: read config, wire, serve. Anything else in
+  there is code no test can reach.
+- **`var _ Iface = (*Impl)(nil)`** next to every implementation that exists to
+  satisfy someone else's interface.
+
+### Write failures that explain themselves
+
+- **`t.Fatalf` when nothing below makes sense; `t.Errorf` otherwise.** Getting
+  it backwards produces the worst failure mode in Go testing: the assertion
+  fails, execution continues, and the report shows a nil-pointer panic instead
+  of the assertion that explains it.
+- **Use the `got/want` phrasing**, and include the input:
+  `t.Errorf("ParseUnits(%q) = %q, want %q", in, got, want)`. A message reading
+  "failed" costs a debugging session.
+- **`%q` for strings.** `want ` and `want   ` are the same line; `want ""` and
+  `want "   "` are not.
+- **`errors.Is`, never string comparison.** Define sentinels, wrap with `%w`, and
+  a message reworded tomorrow is not a build failure.
+- **`t.Helper()` in every helper**, or every failure points at the helper.
+
+### Keep tests independent and honest
+
+- **`t.Cleanup` over `defer`.** It runs even after `t.Fatal`, and it works when
+  registered inside a helper — where a `defer` would fire when the helper
+  returns.
+- **`t.Parallel()` on both levels**, and remember parallel subtests finish
+  *after* the parent returns, so anything the parent defers has already run.
+- **`t.Setenv` panics in a parallel test.** That is the language telling you to
+  inject the environment instead.
+- **`-race` on every run.** A data race that only shows under load is a
+  production incident, not a test failure.
+- **Never compare floats with `==`.**
+
+### Read the report, not the colour
+
+- **Check the test count.** A build tag, a `t.Skip` and a typo'd `-run` all
+  produce a green run of nothing.
+- **`go test` caches results.** A "pass" may be a replay; `-count=1` forces a
+  real run, which matters the moment an external dependency is involved.
+- **Coverage counts statements, not assertions**, and 0% at the unit tier can
+  mean "tested by the tier that can actually test it" — read unit and
+  integration coverage together.
+- **Review every golden-file diff.** `-update` makes any failure disappear,
+  including a real one.
+- **A skipped test needs an issue.** Otherwise it is a deletion nobody approved.
 
 ---
 
